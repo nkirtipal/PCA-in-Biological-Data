@@ -10,6 +10,7 @@ explains. These four notebooks work through it on three data types, using the
 transformation and interpretation each one actually needs.
 
 ![scree](figures/scree_pbmc3k.png)
+![PCA illustration](notebooks/01_pca_from_scratch_files/figure-gfm/unnamed-chunk-3-1.png)
 
 ---
 
