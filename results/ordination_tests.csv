@@ -1,0 +1,3 @@
+"distance","permanova_R2","permanova_p","betadisper_p","dispersion_confounded"
+"Bray-Curtis",0.733,0.001,0.0013,"yes"
+"Aitchison (CLR)",0.805,0.001,0.1006,"no"
