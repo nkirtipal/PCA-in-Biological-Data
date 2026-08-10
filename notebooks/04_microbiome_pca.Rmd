@@ -1,0 +1,312 @@
+---
+title: "PCA on Microbiome Data"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 6, fig.height = 5)
+```
+
+Microbiome data breaks one of PCA's assumptions in a way that bulk and single-cell RNA-seq do not, and the failure is visible rather than subtle.
+
+Relative abundances are **compositional**. Every sample sums to 1, so if one taxon goes up another must come down — a negative correlation structure that exists because of the constraint, not because of biology. The data lives on a simplex, not in the Euclidean space PCA assumes.
+
+This notebook shows the failure, the CLR fix, the alternative the field uses more often (PCoA on Bray-Curtis), and the two tests that usually accompany it — plus the check that usually gets skipped.
+
+**Data:** `GlobalPatterns` — 16S sequencing across nine environment types, from soil and ocean to human gut and skin. Caporaso et al. (2011), *PNAS* 108:4516.
+
+```{r}
+library(phyloseq)
+library(compositions)
+library(vegan)
+
+pal <- c("#1B6B70", "#E07A5F", "#2A4B7C", "#81B29A", "#F2CC8F",
+         "#8E7DBE", "#D62828", "#6A994E", "#BC4749")
+
+data(GlobalPatterns)
+GlobalPatterns
+```
+
+------------------------------------------------------------------------
+
+## Filtering
+
+19,216 taxa across 26 samples, most near-zero. Keeping taxa with reasonable total abundance and presence in more than five samples:
+
+```{r}
+gp <- prune_taxa(taxa_sums(GlobalPatterns) > 100, GlobalPatterns)
+gp <- prune_taxa(rowSums(otu_table(gp) > 0) > 5, gp)
+gp
+
+env  <- sample_data(gp)$SampleType
+cols <- pal[as.integer(factor(env))]
+table(env)
+```
+
+Note the group sizes: two to four samples each. That matters later.
+
+------------------------------------------------------------------------
+
+## PCA on relative abundances
+
+The obvious thing to do, and what many pipelines still do.
+
+```{r}
+gp_rel <- transform_sample_counts(gp, function(x) x / sum(x))
+
+X_rel <- t(as(otu_table(gp_rel), "matrix"))
+p_rel <- prcomp(X_rel, center = TRUE, scale. = FALSE)
+
+plot(p_rel$x[, 1], p_rel$x[, 2], col = cols, pch = 19,
+     xlab = "PC1", ylab = "PC2", main = "PCA on relative abundance")
+```
+
+Three points far right, everything else crushed against the axis. Soil, ocean, gut, skin and tongue — genuinely different ecosystems — are indistinguishable.
+
+------------------------------------------------------------------------
+
+## Diagnosing it
+
+```{r}
+vp_rel <- round(100 * p_rel$sdev[1:5]^2 / sum(p_rel$sdev^2), 1)
+vp_rel
+```
+
+PC1 takes 36.1% of the variance. Which taxa build that axis?
+
+```{r}
+top <- sort(abs(p_rel$rotation[, 1]), decreasing = TRUE)[1:5]
+tax_table(gp)[names(top), c("Phylum", "Genus")]
+```
+
+Cyanobacteria, including *Dolichospermum*. And the samples at the extremes:
+
+```{r}
+data.frame(type = env, PC1 = round(p_rel$x[, 1], 3))[order(-p_rel$x[, 1]), ][1:5, ]
+```
+
+All three are freshwater creek. This is a cyanobacterial bloom.
+
+One taxon at high relative abundance in three samples consumed the entire first component. Because abundances are bounded and sum to 1, a dominant organism does not merely add variance — it suppresses everything else in those samples at the same time. PCA reads that as the strongest signal in the dataset, which numerically it is.
+
+------------------------------------------------------------------------
+
+## The fix: centred log-ratio
+
+CLR divides each count by the sample's geometric mean and takes the log, removing the sum-to-one constraint and moving the data into Euclidean space. PCA on CLR-transformed data is sometimes called Aitchison PCA.
+
+The `+ 1` pseudocount handles zeros, since log(0) is undefined. Zero handling in compositional data is a genuine open problem and more principled imputation methods exist; for real work they are worth using.
+
+```{r}
+X_counts <- t(as(otu_table(gp), "matrix"))
+X_clr <- compositions::clr(X_counts + 1)
+p_clr <- prcomp(X_clr, center = TRUE, scale. = FALSE)
+
+vp_clr <- round(100 * p_clr$sdev[1:5]^2 / sum(p_clr$sdev^2), 1)
+vp_clr
+```
+
+```{r echo=FALSE}
+dir.create("../figures", showWarnings = FALSE)
+dir.create("../results", showWarnings = FALSE)
+```
+
+```{r fig.width=11, fig.height=5}
+layout(matrix(c(1, 2, 3), nrow = 1), widths = c(1, 1, 0.5))
+par(mar = c(4.5, 4.5, 3, 1))
+
+plot(p_rel$x[, 1], p_rel$x[, 2], col = cols, pch = 19,
+     xlab = paste0("PC1 (", vp_rel[1], "%)"),
+     ylab = paste0("PC2 (", vp_rel[2], "%)"), main = "Relative abundance")
+
+plot(p_clr$x[, 1], p_clr$x[, 2], col = cols, pch = 19,
+     xlab = paste0("PC1 (", vp_clr[1], "%)"),
+     ylab = paste0("PC2 (", vp_clr[2], "%)"), main = "CLR-transformed")
+
+par(mar = c(0, 0, 0, 0)); plot.new()
+legend("center", levels(factor(env)), col = pal[1:nlevels(factor(env))],
+       pch = 19, cex = 0.8, bty = "n")
+```
+
+```{r echo=FALSE, results='hide'}
+png("../figures/microbiome_pca_comparison.png", width = 2600, height = 1100, res = 300)
+layout(matrix(c(1, 2, 3), nrow = 1), widths = c(1, 1, 0.5))
+par(mar = c(4.5, 4.5, 3, 1))
+plot(p_rel$x[, 1], p_rel$x[, 2], col = cols, pch = 19,
+     xlab = paste0("PC1 (", vp_rel[1], "%)"),
+     ylab = paste0("PC2 (", vp_rel[2], "%)"), main = "Relative abundance")
+plot(p_clr$x[, 1], p_clr$x[, 2], col = cols, pch = 19,
+     xlab = paste0("PC1 (", vp_clr[1], "%)"),
+     ylab = paste0("PC2 (", vp_clr[2], "%)"), main = "CLR-transformed")
+par(mar = c(0, 0, 0, 0)); plot.new()
+legend("center", levels(factor(env)), col = pal[1:nlevels(factor(env))],
+       pch = 19, cex = 0.8, bty = "n")
+dev.off()
+```
+
+PC1 falls from **36.1%** to **22.8%**, and every environment type now occupies its own region.
+
+Variance-explained is often read as a quality score. Here the higher number was one taxon's abundance in three samples; the lower number is ecological structure across nine environments. A scree plot cannot tell you which of those you have.
+
+------------------------------------------------------------------------
+
+## Bray-Curtis and PCoA
+
+CLR + PCA is the compositionally principled route. The field more often uses **PCoA on Bray-Curtis distance**, which takes a different approach: rather than transforming the data so Euclidean distance becomes meaningful, it defines a distance measure suited to abundance data and ordinates that.
+
+Bray-Curtis needs no pseudocount, but gives no loadings — you cannot read taxa off the axes the way you can with PCA.
+
+```{r}
+d_bray <- vegdist(X_rel, method = "bray")
+pcoa   <- cmdscale(d_bray, k = 5, eig = TRUE)
+
+vp_pcoa <- round(100 * pcoa$eig[1:5] / sum(pcoa$eig[pcoa$eig > 0]), 1)
+vp_pcoa
+```
+
+```{r}
+plot(pcoa$points[, 1], pcoa$points[, 2], col = cols, pch = 19,
+     xlab = paste0("PCo1 (", vp_pcoa[1], "%)"),
+     ylab = paste0("PCo2 (", vp_pcoa[2], "%)"),
+     main = "PCoA on Bray-Curtis")
+legend("topright", levels(factor(env)), col = pal[1:nlevels(factor(env))],
+       pch = 19, cex = 0.6, bty = "n")
+```
+
+```{r echo=FALSE, results='hide'}
+png("../figures/pcoa_bray.png", width = 2000, height = 1600, res = 300)
+par(mar = c(4.5, 4.5, 3, 1))
+plot(pcoa$points[, 1], pcoa$points[, 2], col = cols, pch = 19,
+     xlab = paste0("PCo1 (", vp_pcoa[1], "%)"),
+     ylab = paste0("PCo2 (", vp_pcoa[2], "%)"),
+     main = "PCoA on Bray-Curtis")
+legend("topright", levels(factor(env)), col = pal[1:nlevels(factor(env))],
+       pch = 19, cex = 0.6, bty = "n")
+dev.off()
+```
+
+This recovers structure from the *relative abundances* that plain PCA could not — the distance measure is doing the work the CLR transform did in the previous section.
+
+But note that it arranges the samples differently. In the CLR ordination soil sat at the extreme of PC1; here Mock and Feces occupy the extremes and soil sits in the middle.
+
+```{r}
+representation <- data.frame(
+  representation = c("Relative abundance", "CLR-transformed counts",
+                     "Bray-Curtis distances"),
+  method    = c("PCA", "PCA", "PCoA"),
+  axis1_pct = c(vp_rel[1], vp_clr[1], vp_pcoa[1]),
+  axis2_pct = c(vp_rel[2], vp_clr[2], vp_pcoa[2])
+)
+representation
+```
+
+```{r echo=FALSE}
+write.csv(representation, "../results/ordination_by_representation.csv",
+          row.names = FALSE)
+```
+
+Same 26 samples. The first axis carries 36.1%, 22.8% or 14.8% of the variation depending only on how the data is represented. Nobody looking at one of these ordinations alone would guess that.
+
+------------------------------------------------------------------------
+
+## Testing group differences
+
+An ordination shows structure; it does not test it. Two tests are standard.
+
+**PERMANOVA** (`adonis2`) partitions the distance matrix by group and tests whether between-group distances exceed what permutation would produce. It reports R², the proportion of variation attributable to group — which matters as much as the p-value.
+
+```{r}
+adonis2(d_bray ~ env)
+```
+
+R² = 0.733, p = 0.001. Environment accounts for 73% of the variation in community composition.
+
+**ANOSIM** compares ranked between-group and within-group distances, returning R between -1 and 1.
+
+```{r}
+anosim(d_bray, env)
+```
+
+R = 0.988 — near-perfect separation. Worth remembering what these samples are, though: soil, ocean, human gut, skin. About as different as microbial communities get. This is not what to expect from, say, treated versus untreated within one body site.
+
+------------------------------------------------------------------------
+
+## The check that is usually skipped
+
+Both tests assume comparable within-group dispersion. If one group is far more variable than another, either can return significance from that spread rather than from any difference in location — and the ordination will look like separation.
+
+`betadisper` tests it directly:
+
+```{r}
+bd <- betadisper(d_bray, env)
+anova(bd)
+```
+
+**p = 0.0013.** Dispersion does differ between groups, so the PERMANOVA above is ambiguous: the groups may differ in location, in dispersion, or both, and the test cannot separate them.
+
+```{r fig.width=8, fig.height=5.5}
+par(mar = c(9, 4.5, 3, 1))
+boxplot(bd, las = 2, cex.axis = 0.7, col = pal, border = "grey30",
+        main = "Distance to group centroid (Bray-Curtis)",
+        xlab = "", ylab = "Distance")
+```
+
+```{r echo=FALSE, results='hide'}
+png("../figures/betadisper_boxplot.png", width = 2000, height = 1500, res = 300)
+par(mar = c(9, 4.5, 3, 1))
+boxplot(bd, las = 2, cex.axis = 0.7, col = pal, border = "grey30",
+        main = "Distance to group centroid (Bray-Curtis)",
+        xlab = "", ylab = "Distance")
+dev.off()
+par(mar = c(5, 4, 4, 2) + 0.1)
+```
+
+The spread is not subtle. Mock communities sit around 0.04 from their centroid, human faeces around 0.44 — a tenfold difference. That is real biology, not an artifact: a defined mock community is by construction more uniform than gut samples from different people. But it is exactly the situation in which PERMANOVA becomes hard to interpret.
+
+Freshwater and Tongue render as flat lines because they have only two samples each.
+
+------------------------------------------------------------------------
+
+## Does the distance measure change the conclusion?
+
+Euclidean distance on CLR-transformed data is **Aitchison distance** — a compositionally-aware alternative to Bray-Curtis. Running the same two tests on it:
+
+```{r}
+d_aitch <- dist(X_clr)
+adonis2(d_aitch ~ env)
+```
+
+```{r}
+anova(betadisper(d_aitch, env))
+```
+
+```{r}
+tests <- data.frame(
+  distance              = c("Bray-Curtis", "Aitchison (CLR)"),
+  permanova_R2          = c(0.733, 0.805),
+  permanova_p           = c(0.001, 0.001),
+  betadisper_p          = c(0.0013, 0.1006),
+  dispersion_confounded = c("yes", "no")
+)
+tests
+```
+
+```{r echo=FALSE}
+write.csv(tests, "../results/ordination_tests.csv", row.names = FALSE)
+```
+
+The compositionally-aware distance is better on both counts: a **larger** effect size (0.805 against 0.733) and **no dispersion confounding** (p = 0.10 against p = 0.0013).
+
+That is the strongest argument in this notebook for taking compositionality seriously. CLR is not a cosmetic choice that makes the plot look tidier — on this data it changes what the statistics are entitled to conclude. The Bray-Curtis result is significant but ambiguous; the Aitchison result is significant and clean.
+
+------------------------------------------------------------------------
+
+## What to take from this
+
+- **Relative abundances are compositional.** Standard PCA assumes Euclidean geometry; compositional data does not live there.
+- **A dominant taxon can consume PC1** without telling you anything about your question.
+- **The ordination depends on the representation.** 36.1%, 22.8% or 14.8% on the first axis, from the same 26 samples.
+- **Two routes work:** CLR + PCA keeps loadings so you can identify taxa; PCoA on Bray-Curtis handles zeros without a pseudocount but has no loadings. UniFrac adds phylogenetic distance, which neither does.
+- **Ordination shows, it does not test.** And a test without `betadisper` and an effect size is hard to interpret.
+- **Here the compositional route won on the statistics too**, not just the plot.

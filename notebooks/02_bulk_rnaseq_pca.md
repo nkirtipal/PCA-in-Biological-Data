@@ -1,0 +1,381 @@
+PCA on Bulk RNA-seq
+================
+
+Bulk RNA-seq is where most people meet PCA. Almost every paper has a PCA
+plot near the front, usually captioned “samples cluster by condition”
+and left at that.
+
+This notebook works through what PC1 actually is on a real experiment,
+what happens if you skip the transformation step, and how to decide how
+many components to keep.
+
+**Data:** `airway` — human airway smooth muscle cells from four donors,
+each with and without dexamethasone treatment. Eight samples, paired
+design. Himes et al. (2014), *PLoS One* 9:e99625.
+
+``` r
+library(DESeq2)
+library(airway)
+
+pal <- c("#1B6B70", "#E07A5F")
+
+data(airway)
+airway
+```
+
+    ## class: RangedSummarizedExperiment 
+    ## dim: 63677 8 
+    ## metadata(1): ''
+    ## assays(1): counts
+    ## rownames(63677): ENSG00000000003 ENSG00000000005 ... ENSG00000273492
+    ##   ENSG00000273493
+    ## rowData names(10): gene_id gene_name ... seq_coord_system symbol
+    ## colnames(8): SRR1039508 SRR1039509 ... SRR1039520 SRR1039521
+    ## colData names(9): SampleName cell ... Sample BioSample
+
+------------------------------------------------------------------------
+
+## The standard plot
+
+`vst()` applies a variance-stabilising transformation. Raw count
+variance grows with the mean — a gene at 10,000 counts varies far more
+in absolute terms than one at 10, purely from Poisson sampling. VST
+removes that dependence so PCA sees biological variation rather than
+counting noise.
+
+``` r
+dds <- DESeqDataSet(airway, design = ~ dex)
+vsd <- vst(dds, blind = TRUE)
+
+plotPCA(vsd, intgroup = "dex")
+```
+
+![](02_bulk_rnaseq_pca_files/figure-gfm/unnamed-chunk-3-1.png)<!-- -->
+
+PC1 (41%) separates treated from untreated cleanly. The experiment
+worked.
+
+``` r
+plotPCA(vsd, intgroup = "cell")
+```
+
+![](02_bulk_rnaseq_pca_files/figure-gfm/unnamed-chunk-4-1.png)<!-- -->
+
+The same points coloured by donor. PC2 (26%) is the cell line — each
+donor appears once on each side of PC1, because every donor received
+both treatments.
+
+That structure is worth acting on. The paired design belongs in the
+model:
+
+``` r
+dds2 <- DESeqDataSet(airway, design = ~ cell + dex)
+```
+
+Fitting `~ dex` alone leaves donor differences in the residual variance
+and costs power.
+
+------------------------------------------------------------------------
+
+## What happens without VST
+
+The same PCA on plain log2 counts.
+
+``` r
+rld_raw <- log2(counts(dds) + 1)
+pca_raw <- prcomp(t(rld_raw[rowSums(counts(dds)) > 10, ]))
+
+plot(pca_raw$x[, 1], pca_raw$x[, 2],
+     col = pal[as.integer(colData(dds)$dex)], pch = 19, cex = 1.4,
+     xlab = "PC1", ylab = "PC2", main = "Without VST")
+```
+
+![](02_bulk_rnaseq_pca_files/figure-gfm/unnamed-chunk-6-1.png)<!-- -->
+
+The groups still separate — but along a diagonal rather than along PC1,
+and the points fall on a curve. That arc is the signature of
+unstabilised variance.
+
+``` r
+pv_raw <- pca_raw$sdev^2 / sum(pca_raw$sdev^2)
+round(pv_raw[1:4] * 100, 1)
+```
+
+    ## [1] 34.6 20.4 13.8 11.8
+
+``` r
+pca_vst <- prcomp(t(assay(vsd)[order(rowVars(assay(vsd)), decreasing = TRUE)[1:500], ]))
+pv_vst  <- pca_vst$sdev^2 / sum(pca_vst$sdev^2)
+round(pv_vst[1:4] * 100, 1)
+```
+
+    ## [1] 40.8 26.2 16.9 12.9
+
+------------------------------------------------------------------------
+
+## What PC1 really is without VST
+
+The obvious suspect is sequencing depth. Testing it directly:
+
+``` r
+libsize <- colSums(counts(dds))
+
+cor(pca_raw$x[, 1], libsize)
+```
+
+    ## [1] -0.889946
+
+``` r
+cor(pca_vst$x[, 1], libsize)
+```
+
+    ## [1] -0.1657343
+
+Without VST, PC1 correlates **-0.89** with library size. After VST,
+**-0.17**.
+
+So the first plot was not showing treatment. It was showing how deeply
+each sample was sequenced, with treatment happening to correlate with it
+across eight samples. VST removes that and PC1 becomes biology.
+
+``` r
+pca_summary <- data.frame(
+  transform       = c("raw log2(counts+1)", "VST"),
+  PC1_pct         = c(round(pv_raw[1] * 100, 1), round(pv_vst[1] * 100, 1)),
+  PC2_pct         = c(round(pv_raw[2] * 100, 1), round(pv_vst[2] * 100, 1)),
+  PC1_cor_libsize = c(round(cor(pca_raw$x[, 1], libsize), 3),
+                      round(cor(pca_vst$x[, 1], libsize), 3))
+)
+pca_summary
+```
+
+    ##            transform PC1_pct PC2_pct PC1_cor_libsize
+    ## 1 raw log2(counts+1)    34.6    20.4          -0.890
+    ## 2                VST    40.8    26.2          -0.166
+
+With eight samples a correlation of -0.89 has wide uncertainty. The
+direction is not in doubt and the mechanism is well established, but
+treat the exact figure loosely.
+
+------------------------------------------------------------------------
+
+## Naming PC1
+
+A component is only interpretable if you can say which genes make it up.
+The loadings are the coefficients that define the axis.
+
+``` r
+loadings <- pca_vst$rotation[, 1]
+top      <- sort(abs(loadings), decreasing = TRUE)[1:20]
+genes    <- rowData(airway)$symbol[match(names(top), rownames(assay(vsd)))]
+
+pc1_genes <- data.frame(gene = genes, loading = round(loadings[names(top)], 3))
+pc1_genes
+```
+
+    ##                    gene loading
+    ## ENSG00000109906  ZBTB16   0.137
+    ## ENSG00000152583 SPARCL1   0.122
+    ## ENSG00000211445    GPX3   0.119
+    ## ENSG00000101347  SAMHD1   0.117
+    ## ENSG00000096060   FKBP5   0.115
+    ## ENSG00000163884   KLF15   0.110
+    ## ENSG00000127954  STEAP4   0.109
+    ## ENSG00000171819 ANGPTL7   0.101
+    ## ENSG00000162692   VCAM1  -0.096
+    ## ENSG00000189221    MAOA   0.096
+    ## ENSG00000157514 TSC22D3   0.096
+    ## ENSG00000143127  ITGA10   0.092
+    ## ENSG00000179593 ALOX15B   0.092
+    ## ENSG00000120129   DUSP1   0.090
+    ## ENSG00000102760    RGCC   0.089
+    ## ENSG00000165995  CACNB2   0.089
+    ## ENSG00000168309 FAM107A   0.088
+    ## ENSG00000135821    GLUL   0.088
+    ## ENSG00000170214  ADRA1B   0.088
+    ## ENSG00000198624  CCDC69   0.087
+
+FKBP5, TSC22D3 (GILZ), KLF15, ZBTB16, DUSP1 — canonical glucocorticoid
+receptor targets. PC1 is the glucocorticoid response programme, and you
+can name the genes rather than gesturing at “condition”.
+
+VCAM1 loads negatively while the rest are positive: an inflammatory
+adhesion molecule going down as the anti-inflammatory programme goes up.
+The sign of a loading carries information.
+
+------------------------------------------------------------------------
+
+## Biplot
+
+Samples and gene loadings on the same axes. Arrow direction shows which
+way a gene pulls samples; length shows how strongly.
+
+Six genes, chosen to span the range of directions rather than taken as
+the top six by magnitude. Several of the strongest loadings point almost
+identically — ZBTB16, GPX3, SAMHD1 and KLF15 all sit within 0.01 of each
+other on PC2 — so their arrows overlap and cannot be told apart.
+
+``` r
+round(pca_vst$rotation[names(top)[1:10], 1:2], 3)
+```
+
+    ##                    PC1    PC2
+    ## ENSG00000109906  0.137 -0.006
+    ## ENSG00000152583  0.122  0.012
+    ## ENSG00000211445  0.119 -0.005
+    ## ENSG00000101347  0.117 -0.007
+    ## ENSG00000096060  0.115  0.034
+    ## ENSG00000163884  0.110 -0.014
+    ## ENSG00000127954  0.109 -0.024
+    ## ENSG00000171819  0.101 -0.069
+    ## ENSG00000162692 -0.096  0.008
+    ## ENSG00000189221  0.096  0.033
+
+``` r
+keep <- c("ENSG00000109906",   # ZBTB16   0.137, -0.006  longest PC1
+          "ENSG00000096060",   # FKBP5    0.115, +0.034  clearly up
+          "ENSG00000189221",   # MAOA     0.096, +0.033  up
+          "ENSG00000127954",   # STEAP4   0.109, -0.024  slightly down
+          "ENSG00000171819",   # ANGPTL7  0.101, -0.069  clearly down
+          "ENSG00000162692")   # VCAM1   -0.096, +0.008  opposite direction
+
+sym     <- rowData(airway)$symbol[match(keep, rownames(assay(vsd)))]
+arrows_ <- pca_vst$rotation[keep, 1:2]
+
+sc    <- 0.7 * max(abs(pca_vst$x[, 1:2])) / max(abs(arrows_))
+lab_x <- arrows_[, 1] * sc * 1.20
+lab_y <- arrows_[, 2] * sc * 1.20 + seq(-5, 5, length.out = length(sym))
+
+draw_biplot <- function() {
+  par(mar = c(4.5, 4.5, 3, 1))
+  plot(pca_vst$x[, 1], pca_vst$x[, 2],
+       col = pal[as.integer(colData(dds)$dex)], pch = 19, cex = 1.4,
+       xlab = paste0("PC1 (", round(pv_vst[1] * 100, 1), "%)"),
+       ylab = paste0("PC2 (", round(pv_vst[2] * 100, 1), "%)"),
+       main = "Biplot: samples and selected PC1 genes",
+       xlim = range(pca_vst$x[, 1]) * 1.3,
+       ylim = range(pca_vst$x[, 2]) * 1.3)
+  abline(h = 0, v = 0, col = "grey85", lty = 3)
+  arrows(0, 0, arrows_[, 1] * sc, arrows_[, 2] * sc,
+         col = "grey40", length = 0.08, lwd = 1.5)
+  text(lab_x, lab_y, labels = sym, cex = 0.65, col = "grey20")
+  legend("topleft", levels(colData(dds)$dex), col = pal, pch = 19,
+         bty = "n", cex = 0.8)
+}
+
+draw_biplot()
+```
+
+![](02_bulk_rnaseq_pca_files/figure-gfm/unnamed-chunk-14-1.png)<!-- -->
+
+Every arrow except VCAM1 points right, towards the treated samples. That
+is the glucocorticoid programme turning on. VCAM1 points left, towards
+untreated — the inflammatory gene being suppressed.
+
+A loadings table gives you the same numbers, but the biplot shows
+direction and magnitude in the same space as the samples.
+
+------------------------------------------------------------------------
+
+## Scree plot
+
+``` r
+barplot(pv_vst[1:7] * 100, names.arg = paste0("PC", 1:7),
+        ylab = "% variance", main = "Scree plot (VST)",
+        col = "#1B6B70", border = NA)
+```
+
+![](02_bulk_rnaseq_pca_files/figure-gfm/unnamed-chunk-16-1.png)<!-- -->
+
+A clear break after PC4, then almost nothing. With eight samples there
+are only seven non-zero components, so this scree is short by
+construction.
+
+------------------------------------------------------------------------
+
+## How many PCs, and how much is lost
+
+An alternative to eyeballing the elbow: pick the smallest number of
+components reaching some cumulative variance, then measure how much
+information the truncation discards by reconstructing the data and
+comparing.
+
+``` r
+X  <- t(assay(vsd)[order(rowVars(assay(vsd)), decreasing = TRUE)[1:500], ])
+Xc <- scale(X, center = TRUE, scale = FALSE)
+
+cum <- cumsum(pv_vst)
+n90 <- which(cum >= 0.90)[1]
+cat("PCs needed for 90% of variance:", n90, "of", ncol(pca_vst$x), "\n")
+```
+
+    ## PCs needed for 90% of variance: 4 of 8
+
+``` r
+recon_err <- sapply(1:ncol(pca_vst$x), function(k) {
+  Xhat <- pca_vst$x[, 1:k, drop = FALSE] %*% t(pca_vst$rotation[, 1:k, drop = FALSE])
+  mean((Xc - Xhat)^2)
+})
+
+recon <- data.frame(
+  n_pcs          = seq_along(recon_err),
+  cumulative_pct = round(cum * 100, 1),
+  mse            = round(recon_err, 4)
+)
+recon
+```
+
+    ##   n_pcs cumulative_pct    mse
+    ## 1     1           40.8 0.7539
+    ## 2     2           67.0 0.4203
+    ## 3     3           83.9 0.2048
+    ## 4     4           96.8 0.0407
+    ## 5     5           98.4 0.0202
+    ## 6     6           99.5 0.0070
+    ## 7     7          100.0 0.0000
+    ## 8     8          100.0 0.0000
+
+``` r
+draw_recon <- function() {
+  par(mar = c(4.5, 4.5, 3, 1))
+  plot(recon$n_pcs, recon$mse, type = "b", pch = 19, col = "#1B6B70",
+       xlab = "Number of PCs retained", ylab = "Reconstruction MSE",
+       main = "Information lost by truncating")
+  abline(v = n90, lty = 2, col = "#E07A5F")
+  text(n90 + 0.2, max(recon$mse) * 0.8,
+       paste0("90% variance\nat ", n90, " PCs"),
+       col = "#E07A5F", cex = 0.7, pos = 4)
+}
+
+draw_recon()
+```
+
+![](02_bulk_rnaseq_pca_files/figure-gfm/unnamed-chunk-20-1.png)<!-- -->
+
+Four components reach 96.8% and the reconstruction error drops from
+0.754 to 0.041. The curve flattens exactly where the scree plot breaks.
+
+This works cleanly on bulk data. It is a poor guide for single-cell: in
+notebook 03, fifty PCs reach only 14% of the variance, and demanding 90%
+would mean keeping hundreds. What you discard there is mostly dropout
+noise, so reconstruction error would be measuring how well you reproduce
+noise.
+
+------------------------------------------------------------------------
+
+## What to take from this
+
+- **Transform first.** Without VST, PC1 was sequencing depth. The plot
+  looked fine.
+- **Check what PC1 correlates with** before interpreting it — library
+  size, batch, RIN, collection date. One line each.
+- **Look at the loadings.** “PC1 separates the groups” is an
+  observation; “PC1 is the glucocorticoid response programme, led by
+  FKBP5 and TSC22D3” is a result.
+- **PC2 is not noise.** Here it is donor structure, which says the
+  design should be `~ cell + dex`.
+- **A biplot with too many arrows shows nothing.** Genes with
+  near-identical loadings produce overlapping arrows; pick genes that
+  differ in direction.
+- **Reconstruction error is a quantitative alternative to the elbow** —
+  where the data compresses well. It does not transfer to single-cell.
